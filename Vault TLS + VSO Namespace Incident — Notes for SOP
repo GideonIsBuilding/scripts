@@ -1,0 +1,265 @@
+# Vault TLS + VSO Namespace Incident — Notes for SOP
+
+Sep 29, 2026 · @Gideon Aleonogwe
+
+Cluster: `dev-aws-ue1-mgmt-hub` · Incident window: 2026-09-20 → 2026-09-29
+
+## At a glance
+
+Two unrelated failures stacked on top of each other, and the first one hid the second. The internal CA was regenerated on 20 September but Vault's serving certificate was never reissued, so for eight days Vault presented a certificate signed by a CA that no longer existed anywhere. Every client that loaded the current CA failed to verify it. Fixing that revealed a second, older problem: VSO's default VaultAuth has no Vault Enterprise namespace set, so it authenticates against the root namespace where the roles do not exist.
+
+The TLS failure is resolved. The namespace failure is not, as of this writing.
+
+| When (UTC) | What happened |
+| --- | --- |
+| Sep 20, 18:04 | `vault-internal-ca` regenerated. New CA lands in `vault-ca-secret`. |
+| Sep 20 → Sep 28 | Serving cert `vault-ha-tls` still signed by the retired July CA. Every Vault client that reads the CA from the secret fails TLS. No alert fires. |
+| Sep 25 | CA bundle pushed to the shipyard CI/CD variable for the architecture cluster. Correct at the time. |
+| Sep 28, 18:21:24 | `vault-ha-tls` deleted; cert-manager reissues from the current CA. SIGHUP sent to the Vault process in `vault-1`, then `vault-0`. No pod restarts, no seal/unseal. |
+| Sep 28, 18:45:29 | Last failing VSO reconcile for the gitea secrets. |
+| Sep 29, 15:13:57 | `gitea-admin-secret` reports `Healthy: True`. TLS path confirmed working. |
+| Sep 29, morning | Architecture cluster ClusterSecretStore fails — it holds the pre-28th CA bundle. Portal team demo blocked. |
+| Sep 29, ongoing | `vault-license` still failing with `invalid role name`. Namespace issue, unfixed. |
+
+The reissued certificate is valid until 27 December 2026, with cert-manager renewal scheduled for 27 November.
+
+## Symptoms
+
+Three teams found this independently through three different surfaces, which is why it took a day to establish it was one problem. Nobody was paged; the only signal was a warning event repeating for over forty hours.
+
+**In VSO logs** — repeated login failures against `https://vault.vault.svc:8200/v1/auth/kubernetes/login`:
+
+```
+tls: failed to verify certificate: x509: certificate signed by unknown authority
+(possibly because of "crypto/rsa: verification error" while trying to verify
+candidate authority certificate "vault-internal-ca")
+```
+
+**In VaultStaticSecret status** — `SecretSynced: False` with that same TLS message, across every secret in every namespace.
+
+**In ArgoCD** — applications reporting unhealthy, which is what generated the PagerDuty alerts.
+
+**In External Secrets Operator** — ClusterSecretStore failures on clusters whose CA bundle was pasted in rather than read from a secret. This surfaced late, because those clusters kept working until the certificate was reissued.
+
+**What nothing showed** — no cert-manager error, no Vault error, no pod restart, no CrashLoopBackOff. Vault itself was healthy throughout. The only accumulating signal was a `VaultClientConfigError` warning event, which had fired over 34,000 times across more than 40 hours without anyone being notified.
+
+The distinguishing feature, and the thing that pointed away from operator misconfiguration: **VSO and ESO failed at the same moment with the same error**. Two independently configured operators do not break together unless something they share broke.
+
+## Root cause A — CA rotated, serving certificate left behind
+
+cert-manager regenerated `vault-internal-ca` on 20 September. The new CA went into `vault-ca-secret`, which is where every well-configured client reads it from. Vault's own serving certificate, `vault-ha-tls`, was not reissued and continued to be served by both Vault pods.
+
+That is the whole failure. Clients loaded CA #2 and were handed a certificate signed by CA #1.
+
+**Why nothing looked wrong.** Both cert-manager `Certificate` resources reported `Ready: True` — correctly, since neither had failed at anything. Both certificates carried `CN=vault-internal-ca`, so a subject comparison showed a match. The only place the mismatch is visible is the key identifiers:
+
+|  | Value | notBefore |
+| --- | --- | --- |
+| CA in `vault-ca-secret` (SKI) | `9D:77:39:F9:…:EF:60:22:A1` | Sep 20 2026 18:04:08 |
+| Old serving cert (AKI) | `97:21:9F:…:BF:6E:72:FA` | Jul 27 2026 |
+| Reissued serving cert (AKI) | `9D:77:39:F9:…:EF:60:22:A1` | Sep 28 2026 18:21:24 |
+
+The serving certificate's Authority Key Identifier names the CA that signed it. Before the fix it pointed at the July CA; after, it matches the current CA's Subject Key Identifier. That single comparison is the fastest confirmation of this failure mode and it is worth making the first check in any future Vault TLS incident.
+
+**Why it had no deadline pressure attached.** The old certificate was valid until 25 October, so nothing would have expired for weeks. Expiry monitoring would not have caught this. The certificate was perfectly valid — it was simply signed by the wrong authority.
+
+## Root cause B — VSO targeting the wrong Vault namespace
+
+All five Kubernetes auth roles live in the `admin/dev` Vault Enterprise namespace: `argocd`, `coralogix`, `gitea`, `vault-config-operator`, `vault-secrets-operator`. The root namespace contains only `vault-backup-role`. VSO's `vault/default` VaultAuth has no namespace set, so it logs in against root, root has no such role, and Vault returns `400 invalid role name "vault-secrets-operator"`.
+
+This predates the TLS incident. It was invisible until the TLS fix let connections get far enough to fail at the auth layer instead of the handshake.
+
+The confusing part is that a second VaultAuth on the same cluster, `gitea/default`, has the namespace set correctly. They are generated by two different mechanisms.
+
+&#91;embedded content: VaultAuth generation paths · Kustomize vs Helm\]
+
+Kustomize replacements only apply to resources inside the Kustomize build. `vault/default` is rendered by the Helm chart — its own labels say `managed-by: Helm`, `helm.sh/chart: vault-secrets-operator-1.1.0` — so no edit to the kustomization can reach it, whatever field name is used.
+
+**The fix** is one key in the ArgoCD Application's `valuesObject`:
+
+```yaml
+defaultAuthMethod:
+  enabled: true
+  namespace: admin/dev
+  kubernetes:
+    role: vault-secrets-operator
+    serviceAccount: vault-secrets-operator-controller-manager
+    tokenAudiences:
+      - vault
+```
+
+Confirm the 1.1.0 chart exposes `namespace` at that level before committing. If it does not, set `defaultAuthMethod.enabled: false` and declare the VaultAuth in the kustomization the way gitea's is — that path is known to work, at the cost of taking the resource out of the chart's management.
+
+## Diagnosis — the order to check things in
+
+Run these top to bottom. The first three settle whether you are looking at a TLS problem or an auth problem, which is the fork everything else hangs off.
+
+**1. Read the actual error.** `tls:` or `x509:` in the message means TLS. `invalid role name` or a `400` on `/auth/kubernetes/login` means TLS is fine and you are at the auth layer.
+
+```bash
+kubectl logs -n vault -l app.kubernetes.io/name=vault-secrets-operator --since=10m \
+  | grep -iE 'tls|x509|invalid role' | tail -20
+```
+
+**2. Compare the CA's SKI against the serving certificate's AKI.** These must match.
+
+```bash
+# CA subject key identifier
+kubectl get secret -n vault vault-ca-secret -o jsonpath='{.data.ca\.crt}' | base64 -d \
+  | openssl x509 -noout -dates -text | grep -A1 'Subject Key Identifier'
+
+# serving cert authority key identifier
+kubectl get secret -n vault vault-ha-tls -o jsonpath='{.data.tls\.crt}' | base64 -d \
+  | openssl x509 -noout -dates -text | grep -A1 'Authority Key Identifier'
+```
+
+**3. Confirm what is actually on the wire**, not just what is in the secret. Vault holds its certificate in memory; the secret can be current while the process still serves the old one.
+
+```bash
+kubectl port-forward -n vault vault-0 8200:8200 &
+echo | openssl s_client -connect 127.0.0.1:8200 -showcerts 2>/dev/null \
+  | openssl x509 -noout -dates -text | grep -A1 'Authority Key Identifier'
+```
+
+The Vault pod image has no `openssl`, so this has to be done from a workstation over a port-forward.
+
+**4. If the error is auth, check which Vault namespace VSO is targeting.**
+
+```bash
+kubectl get vaultauth default -n vault  -o jsonpath='{.spec.namespace}{"\n"}'
+kubectl get vaultauth default -n gitea  -o jsonpath='{.spec.namespace}{"\n"}'
+```
+
+Empty means root namespace. Compare against where the roles actually live:
+
+```bash
+vault list -namespace=admin/dev auth/kubernetes/role
+vault list auth/kubernetes/role   # root
+```
+
+**5. Read the right status condition.** `Healthy` is the live signal. `SecretSynced` can sit stale for days — see the traps section below.
+
+```bash
+kubectl get vaultstaticsecret <name> -n <ns> -o jsonpath='{.status}{"\n"}' | jq .
+```
+
+## Recovery — what was done
+
+No pod restarts, no seal/unseal, no downtime. Both Vault pods stayed up throughout and neither was recreated. This matters for the SOP: the instinct is to restart Vault, and it is neither necessary nor desirable.
+
+**1. Delete the stale certificate secret.** cert-manager sees its `Certificate` resource has no backing secret and reissues immediately from the current CA.
+
+```bash
+kubectl delete secret -n vault vault-ha-tls
+```
+
+**2. Confirm the new certificate before touching Vault.** Check the AKI matches the CA's SKI and that the SANs survived the reissue.
+
+```bash
+kubectl get secret -n vault vault-ha-tls -o jsonpath='{.data.tls\.crt}' | base64 -d \
+  | openssl x509 -noout -dates -text | grep -A1 -E 'Authority Key Identifier|Subject Alternative Name'
+```
+
+Expected SANs: `vault`, `vault.vault`, `vault.vault.svc`, `vault.vault.svc.cluster.local`, `*.vault-internal`, `*.vault-internal.vault.svc.cluster.local`, the ELB hostname, and `127.0.0.1`. If any are missing, stop — reloading Vault onto a certificate with wrong SANs will break clients that reach it by another name.
+
+**3. Reload Vault in place, one pod at a time.** Vault reads its certificate at startup and holds it in memory, so the new secret does nothing until the process rereads it. SIGHUP triggers that reread without restarting.
+
+```bash
+# find the vault process — it is usually NOT PID 1
+kubectl exec -n vault vault-1 -- ps aux | grep '[v]ault server'
+kubectl exec -n vault vault-1 -- sh -c 'kill -HUP 12'
+```
+
+Do the standby first, then the active node. `vault operator reload` does not exist in this version — SIGHUP is the mechanism.
+
+**4. Verify what each pod is serving.** Per pod, not through the service, or you will not know whether both reloaded.
+
+```bash
+kubectl port-forward -n vault vault-0 8200:8200 &
+echo | openssl s_client -connect 127.0.0.1:8200 -showcerts 2>/dev/null \
+  | openssl x509 -noout -text | grep -A1 'Authority Key Identifier'
+```
+
+**5. Confirm the error class changed.** Success looks like the TLS errors disappearing and being replaced by something at the auth layer, or by nothing at all. In this incident they were replaced by `invalid role name`, which is how we knew TLS was fixed and a second problem existed.
+
+## False signals — why this hid for eight days
+
+Every one of these cost real time. They are the reason this section exists.
+
+**`Ready: True` on both cert-manager Certificates.** Neither resource had failed. cert-manager issued the CA correctly and issued the serving certificate correctly — in July. Nothing in cert-manager's model says "a leaf certificate must be reissued when its CA is replaced," so there was nothing to report. Readiness here means "I did my job," not "the certificate is currently valid against the current CA."
+
+**Both certificates carry `CN=vault-internal-ca`.** Comparing subjects shows a match. You have to compare SKI against AKI to see the problem. A name comparison actively misleads here.
+
+**`SecretSynced: False` on healthy secrets.** This is the worst one. The five gitea VaultStaticSecrets showed `SecretSynced: False` with a `lastTransitionTime` frozen at 2026-09-28T18:45:29Z and the old TLS error still in the message — nearly a day after the fix, while the secrets were syncing fine. The condition only transitions when the sync outcome changes, and with unchanged secret contents VSO has nothing new to write, so the stale message persists. Meanwhile the same object showed `Healthy: True` at 15:13:57Z the following day.
+
+> Read `Healthy`, not `SecretSynced`. A wall of red `SecretSynced` rows in `kubectl get vaultstaticsecrets -A` is not evidence of current failure.
+
+**Silence in the logs is ambiguous.** Successful reconciles do not log at error level. "No gitea errors in the last hour" is consistent both with everything working and with the controller not processing those objects at all. Resolve it by reading the `Healthy` condition and checking for a `secretMAC`, not by the absence of errors.
+
+**Clients with a hardcoded CA kept working while broken.** Any consumer holding a pasted copy of the July CA validated Vault's stale certificate happily. They were correct for the wrong reason, and they broke the moment the real fix landed. This inverted the usual signal: fixing the root cause is what made those failures appear.
+
+**Vault's own health was never affected.** Vault was up, unsealed and serving the entire time. Any check aimed at Vault rather than at the TLS chain between Vault and its clients came back clean.
+
+## Ruled out — do not re-investigate these
+
+Each of these was a plausible theory that consumed time. Recording the evidence that killed them so nobody repeats the work.
+
+| Theory | Killed by |
+| --- | --- |
+| Missing `system:auth-delegator` / TokenReview permission | `vault-server-binding` → `vault/vault` exists and is correct. Also the wrong leg — this governs Vault calling the Kubernetes API, not clients calling Vault. |
+| Kubernetes cluster CA rotated | `kube-root-ca.crt` and Vault's stored `kubernetes_ca_cert` fingerprints match (`02:77:…:62:B2`, notBefore Jul 22 2026). Again the wrong leg. |
+| JWT issuer mismatch | `disable_iss_validation: true` on the Kubernetes auth mount. |
+| Roles missing from Vault | All five present in `admin/dev`: `argocd`, `coralogix`, `gitea`, `vault-config-operator`, `vault-secrets-operator`. |
+| Audience mismatch | Inconclusive but not implicated. `gitea` role has no `audience` field and works. No working counterexample exists to compare against — `argocd` has no VaultAuth and does not use VSO. |
+| Kubernetes auth mount misconfigured | `vault read -namespace=admin/dev auth/kubernetes/config` is healthy: `kubernetes_host: https://kubernetes.default.svc`, CA cert present, `disable_local_ca_jwt: false`, `token_reviewer_jwt_set: false`. |
+| The failed shipyard pipeline (`#751553`) | Real failure, unrelated cause. `data.aws_ami.amazon_linux_2023` returned no results — a pinned AL2023 AMI that AWS has since deregistered. Blocked an unapplied plan of 13 subnet-tag changes. Nothing to do with Vault. |
+
+The field-name trap is worth its own line. VSO 1.1.0's VaultAuth CRD exposes `spec.namespace` and `spec.allowedNamespaces`. It does **not** expose `spec.vaultNamespace` — that spelling belongs to a later chart version and appears in the chart's `main` branch on GitHub, which is what makes it tempting. Kustomize does not validate field paths against CRDs, so writing to the wrong one is accepted silently, dropped by the API server, and leaves neither field set. Always confirm with `kubectl explain vaultauth.spec --recursive` against the cluster you are changing.
+
+## Blast radius — where CA copies live
+
+This is the systemic finding. A CA rotation propagates to consumers that *reference* the CA secret and does not propagate to consumers that hold a *copy*. Both patterns are in use, and only the first survives rotation.
+
+| Consumer | How it gets the CA | Survived rotation |
+| --- | --- | --- |
+| VSO (`defaultVaultConnection`) | `caCertSecret: vault-ca-secret`, key `ca.crt` | Yes — picked up the reissue with no config change |
+| ESO ClusterSecretStore, dev mgmt hub | `caProvider` → secret `vault-ca-secret` in `external-secrets` | Yes — `Ready: True` throughout, never touched |
+| ESO ClusterSecretStore, architecture cluster | CA bundle held inline | No — failed once the certificate was reissued; blocked the portal team demo |
+| Shipyard CI/CD variable | Value pasted in, last updated Sep 25 | No — holds the pre-reissue CA |
+| Argo env files, `general-1` | Hardcoded per Easton | No — will not self-recover |
+
+The dev mgmt hub ClusterSecretStore is the pattern to copy. It uses `caProvider` pointing at the secret, and it rode both the 20 September rotation and the 28 September reissue without anyone touching it or noticing.
+
+To find the current bundle for anything that still needs a copy:
+
+```bash
+kubectl get secret -n vault vault-ca-secret -o jsonpath='{.data.ca\.crt}' | base64 -d
+```
+
+Current CA SKI is `9D:77:39:F9:…:EF:60:22:A1`, notBefore 20 September 2026.
+
+One consequence worth stating plainly, because it will come up again: **reissuing the serving certificate is what broke the hardcoded consumers.** They were validating a stale certificate successfully. That is not a reason to avoid the fix — the old certificate was already breaking every correctly configured client and had eight days of accumulated failures behind it — but any future CA work should update the copies in the same change window, not afterwards.
+
+## Outstanding
+
+- [ ] Add `namespace: admin/dev` to `defaultAuthMethod` in the VSO ArgoCD Application. Confirm the 1.1.0 chart exposes it at that level first; fallback is `defaultAuthMethod.enabled: false` plus declaring the VaultAuth in the kustomization as gitea's is.
+- [ ] Revert the open MR: `spec.vaultNamespace` → `spec.namespace` in both `dev-aws-ue1-mgmt-hub` and `nonprod-aws-ue1-mgmt-hub-1` kustomizations. Unmerged, so nothing is live.
+- [ ] Update the architecture cluster's ClusterSecretStore with the current CA, or better, switch it to `caProvider`. Blocking the portal team demo.
+- [ ] Update the shipyard CI/CD variable with the current bundle and re-trigger for the architecture cluster.
+- [ ] Answer Easton on the `general-1` Argo env files — hardcoded CA, will not self-recover.
+- [ ] Fix the AMI data source in `network_useast1/data.tf:13` and re-run pipeline `#751553`. Unapplied plan: 13 subnet-tag changes. Separate issue.
+- [ ] Open an incident ticket. Distinct from OPS-3382 and OPS-1798, which are design work — link, do not merge.
+
+## Prevention
+
+Four changes, roughly in order of value.
+
+**Alert on the SKI/AKI mismatch directly.** This is the check that would have caught it on day one, and it is cheap — compare the AKI of the certificate in `vault-ha-tls` against the SKI of the CA in `vault-ca-secret` and alert when they diverge. Expiry monitoring would not have helped; the certificate had five weeks left.
+
+**Alert on `VaultClientConfigError`.** The event fired over 34,000 times across 40+ hours and reached nobody. Any Vault client config error sustained beyond a few minutes should page.
+
+**Eliminate hardcoded CA copies.** Every consumer should reference `vault-ca-secret` rather than hold a pasted bundle — `caProvider` for ESO, `caCertSecret` for VSO. The dev mgmt hub ClusterSecretStore proves this works. Where a copy is genuinely unavoidable, it needs an owner and a rotation runbook entry.
+
+**Make CA rotation reissue its leaves.** Nothing currently forces dependent certificates to be reissued when their issuer is replaced. Until that exists, CA rotation needs a manual step: delete `vault-ha-tls`, verify the new AKI, SIGHUP both pods, and update every hardcoded copy in the same window.
+
+The renewal on 27 November will reproduce this exact failure for anything still holding a copy. That is the deadline for the third and fourth items.
